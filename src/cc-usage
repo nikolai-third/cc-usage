@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Show Claude Code subscription usage: session / weekly limits and extra usage.
+
+Usage:
+  cc-usage           human-readable table
+  cc-usage --json    raw API response
+  cc-usage --cache   fetch silently and refresh the cache used by the statusline and hook
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import cc_usage_core as core  # noqa: E402
+
+
+def print_table(data):
+    for lim in data.get("limits") or []:
+        name = lim["kind"]
+        model = ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+        if model:
+            name += f" ({model})"
+        print(f"{name:24} {lim['percent']:>3}%   resets {core.format_time(lim.get('resets_at'))}")
+
+    spend = data.get("spend") or {}
+    if spend.get("enabled"):
+        used, limit = spend["used"], spend["limit"]
+        k = 10 ** used["exponent"]
+        print(f"{'extra usage':24} {spend['percent']:>3}%   "
+              f"{used['amount_minor'] / k:.2f} / {limit['amount_minor'] / k:.2f} {used['currency']}")
+
+
+def main():
+    try:
+        data = core.fetch()
+    except core.UsageError as e:
+        if "--cache" in sys.argv:
+            sys.exit(1)
+        sys.exit(f"cc-usage: {e}")
+    core.write_cache(data)
+
+    if "--cache" in sys.argv:
+        return
+    if "--json" in sys.argv:
+        print(json.dumps(data, indent=2))
+    else:
+        print_table(data)
+
+
+if __name__ == "__main__":
+    main()
