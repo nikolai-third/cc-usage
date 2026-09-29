@@ -33,14 +33,25 @@ def builtin_line(raw):
     cwd = (data.get("workspace") or {}).get("current_dir")
     if cwd:
         parts.append(f"{DIM}{os.path.basename(cwd) or cwd}{RESET}")
-    remaining = (data.get("context_window") or {}).get("remaining_percentage")
-    if remaining is not None:
-        parts.append(f"{DIM}ctx{RESET} {round(100 - remaining)}%")
     return " │ ".join(parts)
 
 
 def color(pct):
     return "32" if pct < 50 else "33" if pct < 80 else "31"
+
+
+def context_bar(raw, width=10):
+    """`ctx ███░░░░░░░ 30%` from the context fill Claude Code passes on stdin."""
+    try:
+        remaining = (json.loads(raw).get("context_window") or {}).get("remaining_percentage")
+    except (ValueError, AttributeError):
+        return ""
+    if remaining is None:
+        return ""
+    pct = max(0, min(100, round(100 - remaining)))
+    filled = round(pct * width / 100)
+    return (f"{DIM}ctx{RESET} \x1b[{color(pct)}m{'█' * filled}{DIM}{'░' * (width - filled)}{RESET} "
+            f"\x1b[{color(pct)}m{pct}%{RESET}")
 
 
 def usage_segment():
@@ -61,7 +72,7 @@ def main():
     statusline = core.load_config().get("wrapped_statusline")
     base = wrapped_line(raw, statusline) if statusline else builtin_line(raw)
     lines = base.split("\n")
-    segment = usage_segment()
+    segment = " ".join(s for s in (context_bar(raw), usage_segment()) if s)
     if segment:
         lines[0] = f"{lines[0]} │ {segment}" if lines[0] else segment
     print("\n".join(lines))
