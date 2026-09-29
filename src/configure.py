@@ -144,9 +144,11 @@ def update_claude_md(add):
     text = strip_claude_md_block(text)
     if add:
         text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + claude_md_block()
-    if text.strip() or os.path.exists(CLAUDE_MD):
+    if text.strip():
         with open(CLAUDE_MD, "w") as f:
             f.write(text)
+    elif os.path.exists(CLAUDE_MD):
+        os.remove(CLAUDE_MD)  # it only ever held the cc-usage block
 
 
 def local_bin():
