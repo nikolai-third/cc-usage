@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-"""Show Claude Code subscription usage: session / weekly limits and extra usage.
+"""Show Claude Code subscription usage and configure the statusline segment and limit hook.
 
-Usage:
-  cc-usage           human-readable table
-  cc-usage --json    raw API response
-  cc-usage --cache   fetch silently and refresh the cache used by the statusline and hook
+  cc-usage                    usage table
+  cc-usage --json             raw API response
+  cc-usage --cache            fetch silently and refresh the cache (used internally)
+  cc-usage config             show settings
+  cc-usage config limit NAME [--warn N|off] [--stop N|off] [--show|--hide] [--reset]
+  cc-usage config hook [on|off] [--repeat-warn N] [--repeat-stop N]
+  cc-usage config context on|off    context window bar in the statusline
+  cc-usage config message warn|stop "TEXT" | --reset
+  cc-usage config reset       restore default settings
+
+Limit names: session, weekly, and the model name for model-scoped limits (e.g. fable).
 """
+import argparse
 import json
 import os
 import sys
@@ -15,36 +23,181 @@ import cc_usage_core as core  # noqa: E402
 
 
 def print_table(data):
-    for lim in data.get("limits") or []:
-        name = lim["kind"]
-        model = ((lim.get("scope") or {}).get("model") or {}).get("display_name")
-        if model:
-            name += f" ({model})"
-        print(f"{name:24} {lim['percent']:>3}%   resets {core.format_time(lim.get('resets_at'))}")
+    for name, lim in core.limits_from(data).items():
+        print(f"{name:14} {lim['percent']:>3}%   resets {core.format_time(lim.get('resets_at'))}")
 
     spend = data.get("spend") or {}
     if spend.get("enabled"):
         used, limit = spend["used"], spend["limit"]
         k = 10 ** used["exponent"]
-        print(f"{'extra usage':24} {spend['percent']:>3}%   "
+        print(f"{'extra usage':14} {spend['percent']:>3}%   "
               f"{used['amount_minor'] / k:.2f} / {limit['amount_minor'] / k:.2f} {used['currency']}")
 
 
-def main():
+def show_usage(args):
     try:
         data = core.fetch()
     except core.UsageError as e:
-        if "--cache" in sys.argv:
+        if args.cache:
             sys.exit(1)
         sys.exit(f"cc-usage: {e}")
     core.write_cache(data)
-
-    if "--cache" in sys.argv:
+    if args.cache:
         return
-    if "--json" in sys.argv:
+    if args.json:
         print(json.dumps(data, indent=2))
     else:
         print_table(data)
+
+
+# --- config ----------------------------------------------------------------
+
+def percent(value):
+    if value.lower() in ("off", "none", "-"):
+        return None
+    try:
+        pct = int(value.rstrip("%"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a percentage or 'off', got {value!r}")
+    if not 1 <= pct <= 100:
+        raise argparse.ArgumentTypeError("percentage must be between 1 and 100")
+    return pct
+
+
+def positive(value):
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return n
+
+
+def fmt_pct(value):
+    return "-" if value is None else f"{value}%"
+
+
+def show_config(config):
+    limits, _ = core.load_limits()
+    names = list(limits) + [n for n in config["limits"] if n not in limits]
+    print(f"{'limit':14} {'now':>5} {'warn':>6} {'stop':>6}   statusline")
+    for name in names:
+        s = core.limit_settings(config, name)
+        now = f"{limits[name]['percent']}%" if name in limits else "?"
+        notes = []
+        if name not in config["limits"]:
+            notes.append("default")
+        if name in limits and core.model_of(limits[name]):
+            notes.append(f"hook only while running {core.model_of(limits[name])}")
+        note = f"   ({', '.join(notes)})" if notes else ""
+        print(f"{name:14} {now:>5} {fmt_pct(s['warn']):>6} {fmt_pct(s['stop']):>6}   "
+              f"{'shown' if s['show'] else 'hidden'}{note}")
+    print(f"\ncontext bar: {'on' if config['context_bar'] else 'off'}")
+    hook = config["hook"]
+    print(f"hook: {'on' if hook['enabled'] else 'off'} - repeat warning every "
+          f"{hook['repeat_warn']} tool calls, stop every {hook['repeat_stop']}")
+    print(f"warn message: {hook['warn_message'] or 'built-in'}")
+    print(f"stop message: {hook['stop_message'] or 'built-in'}")
+    print(f"\nconfig file: {core.CONFIG}")
+
+
+def config_limit(config, args):
+    name = args.name.lower()
+    if args.reset:
+        config["limits"].pop(name, None)
+    else:
+        entry = config["limits"].setdefault(name, {})
+        if args.warn is not False:
+            entry["warn"] = args.warn
+        if args.stop is not False:
+            entry["stop"] = args.stop
+        if args.show is not None:
+            entry["show"] = args.show
+        s = core.limit_settings(config, name)
+        if s["warn"] is not None and s["stop"] is not None and s["warn"] >= s["stop"]:
+            sys.exit("cc-usage: warn must be lower than stop")
+    limits, _ = core.load_limits()
+    if name not in limits:
+        print(f"note: no '{name}' limit in the current usage data; known: {', '.join(limits) or '-'}")
+
+
+def config_hook(config, args):
+    if args.state:
+        config["hook"]["enabled"] = args.state == "on"
+    if args.repeat_warn:
+        config["hook"]["repeat_warn"] = args.repeat_warn
+    if args.repeat_stop:
+        config["hook"]["repeat_stop"] = args.repeat_stop
+
+
+def config_context(config, args):
+    config["context_bar"] = args.state == "on"
+
+
+def config_message(config, args):
+    key = f"{args.level}_message"
+    if args.reset or not args.text:
+        config["hook"][key] = None
+    else:
+        config["hook"][key] = args.text
+
+
+def config_reset(config, args):
+    wrapped = config.get("wrapped_statusline")
+    config.clear()
+    config.update(json.loads(json.dumps(core.DEFAULT_CONFIG)))
+    config["wrapped_statusline"] = wrapped
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="cc-usage", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--json", action="store_true", help="print the raw API response")
+    parser.add_argument("--cache", action="store_true", help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="command")
+
+    cfg = sub.add_parser("config", help="show or change settings")
+    cfg_sub = cfg.add_subparsers(dest="action")
+
+    limit = cfg_sub.add_parser("limit", help="thresholds and statusline visibility of one limit")
+    limit.add_argument("name", help="session, weekly, or a model name such as fable")
+    limit.add_argument("--warn", type=percent, default=False, metavar="N|off")
+    limit.add_argument("--stop", type=percent, default=False, metavar="N|off")
+    vis = limit.add_mutually_exclusive_group()
+    vis.add_argument("--show", dest="show", action="store_true", default=None)
+    vis.add_argument("--hide", dest="show", action="store_false")
+    limit.add_argument("--reset", action="store_true", help="back to the default for this limit")
+    limit.set_defaults(func=config_limit)
+
+    hook = cfg_sub.add_parser("hook", help="enable/disable the hook and set reminder frequency")
+    hook.add_argument("state", nargs="?", choices=["on", "off"])
+    hook.add_argument("--repeat-warn", type=positive, metavar="N")
+    hook.add_argument("--repeat-stop", type=positive, metavar="N")
+    hook.set_defaults(func=config_hook)
+
+    ctx = cfg_sub.add_parser("context", help="context window bar in the statusline")
+    ctx.add_argument("state", choices=["on", "off"])
+    ctx.set_defaults(func=config_context)
+
+    msg = cfg_sub.add_parser("message", help="custom instruction the agent gets at a level")
+    msg.add_argument("level", choices=["warn", "stop"])
+    msg.add_argument("text", nargs="?")
+    msg.add_argument("--reset", action="store_true", help="back to the built-in message")
+    msg.set_defaults(func=config_message)
+
+    reset = cfg_sub.add_parser("reset", help="restore default settings")
+    reset.set_defaults(func=config_reset)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.command != "config":
+        show_usage(args)
+        return
+    config = core.load_config()
+    if getattr(args, "func", None):
+        args.func(config, args)
+        core.save_config(config)
+    show_config(config)
 
 
 if __name__ == "__main__":

@@ -3,21 +3,25 @@
 Claude Code subscription usage — in your terminal, in the statusline, and in front of the agent itself.
 
 - **`cc-usage`** prints the same numbers as `/usage`: 5-hour session, weekly limits, extra-usage spend.
-- **Statusline segment** appends `5h 18% 7d 20%` to your existing statusline (or shows a minimal one).
+- **Statusline segment** appends `ctx ██░░░░░░░░ 15% 5h 18% 7d 20% Fable 0%` to your existing statusline
+  (or shows a minimal one).
 - **Limit hook** tells the agent when you are close to a limit, so a long autonomous run wraps up and
   leaves a handoff instead of dying mid-task:
 
-  | Limit          | Warning (finish current work, tell you) | Critical (write `HANDOFF.md`, stop) |
-  |----------------|------------------------------------------|-------------------------------------|
-  | 5-hour session | 80%                                      | 90%                                 |
-  | Weekly         | —                                        | 95%                                 |
+  | Limit                          | Warning (finish current work, tell you) | Critical (write `HANDOFF.md`, stop) |
+  |--------------------------------|------------------------------------------|-------------------------------------|
+  | 5-hour session                 | 80%                                      | 90%                                 |
+  | Weekly                         | —                                        | 95%                                 |
+  | Weekly per model (e.g. Fable)  | —                                        | 95%, only while running that model  |
+
+- **`cc-usage config`** changes all of that from the command line — or just ask the agent to.
 
 ```
 $ cc-usage
-session                   18%   resets Tue 29 Sep 19:09
-weekly_all                20%   resets Mon 05 Oct 23:59
-weekly_scoped (Fable)      0%   resets Tue 06 Oct 00:00
-extra usage               25%   12.50 / 50.00 USD
+session         18%   resets Tue 29 Sep 19:09
+weekly          20%   resets Mon 05 Oct 23:59
+fable            0%   resets Tue 06 Oct 00:00
+extra usage     25%   12.50 / 50.00 USD
 ```
 
 ## Install
@@ -57,18 +61,37 @@ Restores your original statusline, removes the hooks and the CLAUDE.md block, an
 
 ## Configuration
 
-`~/.claude/cc-usage/config.json`:
+```
+$ cc-usage config
+limit            now   warn   stop   statusline
+session          18%    80%    90%   shown
+weekly           20%      -    95%   shown
+fable             0%      -    95%   shown   (default, hook only while running Fable)
 
-```json
-{
-  "thresholds": {
-    "session": [80, 90],
-    "weekly_all": [null, 95]
-  }
-}
+context bar: on
+hook: on - repeat warning every 25 tool calls, stop every 5
+warn message: built-in
+stop message: built-in
 ```
 
-Each pair is `[warning %, critical %]`; `null` disables that level. Changes apply immediately.
+Limit names are `session`, `weekly`, and the lowercased model name for per-model weekly limits.
+Percentages accept `off` to disable a level. Changes apply immediately.
+
+```sh
+cc-usage config limit session --warn 70 --stop 85   # thresholds
+cc-usage config limit fable --warn 80                # per-model limits work the same way
+cc-usage config limit weekly --hide                  # remove from the statusline (--show to bring back)
+cc-usage config limit session --reset                # back to the default
+cc-usage config context off                          # hide the context bar (e.g. if your statusline has one)
+cc-usage config hook off                             # disable the hook (on to enable)
+cc-usage config hook --repeat-warn 10 --repeat-stop 3
+cc-usage config message stop "Run /gsd-pause-work, then stop."   # custom instruction for a level
+cc-usage config message stop --reset
+cc-usage config reset                                # all defaults
+```
+
+Settings live in `~/.claude/cc-usage/config.json` and survive re-installs. The agent knows about
+`cc-usage config`, so "raise the 5h stop to 95%" in a Claude Code session works too.
 
 ## How it works
 
@@ -80,6 +103,7 @@ Each pair is `[warning %, critical %]`; `null` disables that level. Changes appl
   A `?` after the numbers means the data is older than 10 minutes.
 - The hook injects `[usage] …` messages through `additionalContext`. A level is announced when first
   reached, then repeated every 25 (warning) or 5 (critical) tool calls, and on every prompt you send.
+  Per-model limits are checked against the model of the latest reply in the session transcript.
 
 ## Caveats
 

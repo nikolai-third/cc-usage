@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """PostToolUse / UserPromptSubmit hook: warns the agent about subscription limits.
 
-Default thresholds (override in config.json; the most severe level across limits wins):
-  5-hour session: >= 80% WARNING (finish, don't start new work), >= 90% CRITICAL (handoff + stop)
-  weekly:         >= 95% CRITICAL only - a weekly warning would stall work for days
+Per-limit thresholds come from config.json (edit with `cc-usage config`); the most
+severe level across limits wins. Defaults:
+  session (5-hour): warn at 80% (finish, don't start new work), stop at 90% (handoff + stop)
+  weekly:           stop at 95% only - a weekly warning would stall work for days
+  model-scoped (e.g. fable): stop at 95%, and only while the session runs on that model
 
 On PostToolUse a level is announced when first reached, then repeated every
-REPEAT[level] tool calls. On UserPromptSubmit it is announced on every prompt.
-Advisory only: never blocks a tool call. Fails open on any error.
+repeat_warn / repeat_stop tool calls. On UserPromptSubmit it is announced on every
+prompt. Advisory only: never blocks a tool call. Fails open on any error.
 """
 import json
 import os
@@ -18,26 +20,49 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import cc_usage_core as core  # noqa: E402
 
-REPEAT = {1: 25, 2: 5}             # tool calls between repeated reminders per level
 MAX_DATA_AGE = 10 * 60             # ignore older data: the window may have reset since
 STATE_DIR = os.path.join(core.INSTALL_DIR, "state")
 STATE_TTL = 7 * 24 * 3600          # per-session state files older than this are pruned
-LABELS = {"session": "5-hour session limit", "weekly_all": "weekly limit"}
+TRANSCRIPT_TAIL = 256 * 1024       # bytes of transcript scanned for the current model
+
+WARN_MESSAGE = ("Finish the current task, avoid starting large new work or spawning many "
+                "subagents, and mention the limit to the user.")
+STOP_MESSAGE = ("CRITICAL: stop starting new work. Bring the current step to a consistent state, "
+                "write HANDOFF.md in the working directory (goal, what is done, what is in "
+                "progress, exact next steps, relevant files, and commands to verify the current "
+                "state), then stop and tell the user the limit was reached. Continue only if the "
+                "user explicitly tells you to go on past the limit.")
 
 
-def level_of(lim, thresholds):
-    warning, critical = thresholds[lim["kind"]]
-    pct = lim["percent"]
-    if critical is not None and pct >= critical:
+def current_model(transcript_path):
+    """Model id of the latest assistant message, e.g. "claude-opus-5-5", or None."""
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(max(0, os.path.getsize(transcript_path) - TRANSCRIPT_TAIL))
+            tail = f.read().decode("utf-8", "ignore")
+    except (OSError, TypeError):
+        return None
+    models = re.findall(r'"model"\s*:\s*"([^"]+)"', tail)
+    return models[-1] if models else None
+
+
+def level_of(pct, settings):
+    if settings["stop"] is not None and pct >= settings["stop"]:
         return 2
-    return 1 if warning is not None and pct >= warning else 0
+    return 1 if settings["warn"] is not None and pct >= settings["warn"] else 0
 
 
-def worst_limit(limits, thresholds):
-    """Return (limit, level) for the most severe limit, or (None, 0) if none is known."""
-    candidates = [limits[k] for k in thresholds if k in limits and k in LABELS]
-    lim = max(candidates, key=lambda l: (level_of(l, thresholds), l["percent"]), default=None)
-    return lim, level_of(lim, thresholds) if lim else 0
+def worst_limit(limits, config, model):
+    """Return (name, limit, level) for the most severe applicable limit."""
+    best = (None, None, 0)
+    for name, lim in limits.items():
+        scoped = core.model_of(lim)
+        if scoped and not (model and scoped.lower() in model.lower()):
+            continue  # a model-scoped limit only matters while running that model
+        level = level_of(lim["percent"], core.limit_settings(config, name))
+        if best[1] is None or (level, lim["percent"]) > (best[2], best[1]["percent"]):
+            best = (name, lim, level)
+    return best
 
 
 def load_state(path):
@@ -60,33 +85,37 @@ def prune_states():
             pass
 
 
-def message(lim, level, critical_pct, cwd):
+def message(name, lim, level, config):
+    hook = config["hook"]
     reset = core.format_time(lim.get("resets_at"))
-    head = f"[usage] {LABELS[lim['kind']]} at {lim['percent']}% (resets {reset})."
-    if level == 1:
-        return (f"{head} Finish the current task, avoid starting large new work or spawning many "
-                "subagents, and mention the limit to the user."
-                + (f" At {critical_pct}% you will have to write a handoff and stop." if critical_pct else ""))
-    return (f"{head} CRITICAL: stop starting new work. Bring the current step to a consistent state, "
-            "write HANDOFF.md in the working directory (goal, what is done, what is in progress, "
-            "exact next steps, relevant files, and commands to verify the current state), then stop "
-            "and tell the user the limit was reached. Continue only if the user explicitly tells "
-            "you to go on past the limit.")
+    head = f"[usage] {core.long_label(name, lim)} at {lim['percent']}% (resets {reset})."
+    if level == 2:
+        return f"{head} {hook['stop_message'] or STOP_MESSAGE}"
+    text = f"{head} {hook['warn_message'] or WARN_MESSAGE}"
+    stop = core.limit_settings(config, name)["stop"]
+    if stop is not None and not hook["warn_message"]:
+        text += f" At {stop}% you will have to write a handoff and stop."
+    return text
 
 
 def main():
     data = json.load(sys.stdin)
+    config = core.load_config()
+    if not config["hook"]["enabled"]:
+        return
     event = data.get("hook_event_name", "PostToolUse")
-    thresholds = core.load_config()["thresholds"]
     limits, age = core.load_limits()
-    lim, level = worst_limit(limits, thresholds)
-    if lim is None or age > MAX_DATA_AGE:
+    if age > MAX_DATA_AGE:
+        return
+    name, lim, level = worst_limit(limits, config, current_model(data.get("transcript_path")))
+    if lim is None:
         return
 
     session = re.sub(r"[^A-Za-z0-9_-]", "", data.get("session_id", "")) or "unknown"
     os.makedirs(STATE_DIR, exist_ok=True)
     state_path = os.path.join(STATE_DIR, f"{session}.json")
     state = load_state(state_path)
+    repeat = {1: config["hook"]["repeat_warn"], 2: config["hook"]["repeat_stop"]}
 
     if event == "UserPromptSubmit":
         emit = level > 0
@@ -97,17 +126,16 @@ def main():
         emit, state = False, {"level": level, "calls": 0}
     else:
         state["calls"] += 1
-        emit = state["calls"] >= REPEAT[level]
+        emit = state["calls"] >= repeat[level]
         if emit:
             state["calls"] = 0
 
     with open(state_path, "w") as f:
         json.dump(state, f)
     if emit:
-        critical_pct = thresholds[lim["kind"]][1]
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": event,
-            "additionalContext": message(lim, level, critical_pct, data.get("cwd") or os.getcwd()),
+            "additionalContext": message(name, lim, level, config),
         }}))
 
 

@@ -54,13 +54,13 @@ def context_bar(raw, width=10):
             f"\x1b[{color(pct)}m{pct}%{RESET}")
 
 
-def usage_segment():
+def usage_segment(config):
     limits, age = core.load_limits()
     parts = []
-    for kind, label in (("session", "5h"), ("weekly_all", "7d")):
-        if kind in limits:
-            pct = limits[kind]["percent"]
-            parts.append(f"{DIM}{label}{RESET} \x1b[{color(pct)}m{pct}%{RESET}")
+    for name, lim in limits.items():
+        if core.limit_settings(config, name)["show"]:
+            pct = lim["percent"]
+            parts.append(f"{DIM}{core.short_label(name, lim)}{RESET} \x1b[{color(pct)}m{pct}%{RESET}")
     if not parts:
         return ""
     # a "?" marks data older than 10 minutes (offline, expired token, ...)
@@ -69,10 +69,12 @@ def usage_segment():
 
 def main():
     raw = sys.stdin.read()
-    statusline = core.load_config().get("wrapped_statusline")
+    config = core.load_config()
+    statusline = config.get("wrapped_statusline")
     base = wrapped_line(raw, statusline) if statusline else builtin_line(raw)
     lines = base.split("\n")
-    segment = " ".join(s for s in (context_bar(raw), usage_segment()) if s)
+    ctx = context_bar(raw) if config["context_bar"] else ""
+    segment = " ".join(s for s in (ctx, usage_segment(config)) if s)
     if segment:
         lines[0] = f"{lines[0]} │ {segment}" if lines[0] else segment
     print("\n".join(lines))

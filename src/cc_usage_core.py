@@ -22,9 +22,24 @@ KEYCHAIN_SERVICE = os.environ.get("CC_USAGE_KEYCHAIN_SERVICE", "Claude Code-cred
 MAX_AGE = 120      # seconds before the cache is considered stale
 RETRY_EVERY = 60   # min seconds between background refresh attempts (also covers failures)
 
+# Limit names: "session" (5-hour), "weekly" (all models), and the lowercased model
+# name for model-scoped weekly limits (e.g. "fable").
 DEFAULT_CONFIG = {
-    # limit kind -> [warning %, critical %]; null disables that level
-    "thresholds": {"session": [80, 90], "weekly_all": [None, 95]},
+    "limits": {
+        "session": {"warn": 80, "stop": 90, "show": True},
+        "weekly": {"warn": None, "stop": 95, "show": True},
+    },
+    # applies to model-scoped limits (and any future limit) without their own entry
+    "default_limit": {"warn": None, "stop": 95, "show": True},
+    # context window fill bar in the statusline segment (turn off if your statusline has one)
+    "context_bar": True,
+    "hook": {
+        "enabled": True,
+        "repeat_warn": 25,     # tool calls between repeated warning reminders
+        "repeat_stop": 5,      # tool calls between repeated stop reminders
+        "warn_message": None,  # custom instruction text; None = built-in
+        "stop_message": None,
+    },
     # the statusline command that was configured before cc-usage wrapped it
     "wrapped_statusline": None,
 }
@@ -34,18 +49,35 @@ class UsageError(Exception):
     pass
 
 
+def _merge(base, override):
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
 def load_config():
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     try:
         with open(CONFIG) as f:
-            config.update(json.load(f))
+            stored = json.load(f)
     except (OSError, ValueError):
-        pass
-    return config
+        return config
+    # config format of the first release: {"thresholds": {"session": [w, s], "weekly_all": [w, s]}}
+    for kind, (warn, stop) in (stored.pop("thresholds", None) or {}).items():
+        name = "weekly" if kind == "weekly_all" else kind
+        stored.setdefault("limits", {}).setdefault(name, {"warn": warn, "stop": stop})
+    return _merge(config, stored)
 
 
 def save_config(config):
     _write_json(CONFIG, config)
+
+
+def limit_settings(config, name):
+    return {**config["default_limit"], **config["limits"].get(name, {})}
 
 
 def _write_json(path, obj):
@@ -121,8 +153,41 @@ def refresh_if_stale(fetched_at):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def model_of(lim):
+    return ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+
+
+def limit_name(lim):
+    if lim["kind"] == "session":
+        return "session"
+    if lim["kind"] == "weekly_all":
+        return "weekly"
+    model = model_of(lim)
+    return model.lower() if model else lim["kind"]
+
+
+def short_label(name, lim):
+    """Statusline label: 5h / 7d / model name."""
+    return {"session": "5h", "weekly": "7d"}.get(name) or model_of(lim) or name
+
+
+def long_label(name, lim):
+    """Label used in agent-facing messages."""
+    if name == "session":
+        return "5-hour session limit"
+    if name == "weekly":
+        return "weekly limit"
+    model = model_of(lim)
+    return f"weekly {model} limit" if model else f"{name} limit"
+
+
+def limits_from(data):
+    """Map limit name -> limit dict, in API order."""
+    return {limit_name(lim): lim for lim in data.get("limits") or []}
+
+
 def load_limits():
-    """Return (limits, age_seconds) from the cache: limits maps kind -> limit dict."""
+    """Return (limits, age_seconds) from the cache; see limits_from()."""
     try:
         with open(CACHE) as f:
             cached = json.load(f)
@@ -130,8 +195,7 @@ def load_limits():
         cached = {"fetched_at": 0, "data": {}}
     fetched_at = cached.get("fetched_at", 0)
     refresh_if_stale(fetched_at)
-    limits = {lim["kind"]: lim for lim in cached.get("data", {}).get("limits") or []}
-    return limits, time.time() - fetched_at
+    return limits_from(cached.get("data", {})), time.time() - fetched_at
 
 
 def format_time(ts, fmt="%a %d %b %H:%M"):

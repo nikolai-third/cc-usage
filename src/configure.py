@@ -116,14 +116,17 @@ def unwrap_statusline(settings, config):
 
 
 def claude_md_block():
+    cli = os.path.join(TARGET, "cc-usage")
     return f"""{MARK_START}
 ## Subscription usage (cc-usage)
 
-- Check current Claude subscription usage with `{os.path.join(TARGET, "cc-usage")}` (`--json` for raw
+- Check current Claude subscription usage with `{cli}` (`--json` for raw
   data) before large or long-running work and whenever the user asks about limits or usage.
 - Messages starting with `[usage]` come from the cc-usage limit hook. Follow them: at the warning level
   finish the current work and tell the user; at the critical level write a handoff and stop unless the
   user explicitly says to continue.
+- When the user wants to change thresholds, statusline visibility, reminder frequency or hook messages,
+  use `{cli} config` (run `{cli} config --help` for the subcommands).
 {MARK_END}
 """
 
