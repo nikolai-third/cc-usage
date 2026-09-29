@@ -198,8 +198,8 @@ def install(args):
     try:
         data = core.fetch()
         core.write_cache(data)
-        for lim in data.get("limits") or []:
-            say(f"{lim['kind']:16} {lim['percent']:>3}%")
+        for name, lim in core.limits_from(data).items():
+            say(f"{name:16} {lim['percent']:>3}%")
     except core.UsageError as e:
         say(f"could not fetch usage yet: {e}")
     print("\nDone. Restart Claude Code to activate the hook and statusline.")
