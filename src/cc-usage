@@ -5,13 +5,17 @@
   cc-usage --json             raw API response
   cc-usage --cache            fetch silently and refresh the cache (used internally)
   cc-usage config             show settings
-  cc-usage config limit NAME [--warn N|off] [--stop N|off] [--show|--hide] [--reset]
+  cc-usage config limit NAME [--warn N|on|off] [--stop N|on|off] [--show|--hide] [--reset]
   cc-usage config hook [on|off] [--repeat-warn N] [--repeat-stop N]
-  cc-usage config context on|off    context window bar in the statusline
+  cc-usage config style percent|bar [--width N]   statusline look
+  cc-usage config context on|off    context window fill in the statusline
   cc-usage config message warn|stop "TEXT" | --reset
   cc-usage config reset       restore default settings
 
 Limit names: session, weekly, and the model name for model-scoped limits (e.g. fable).
+Each limit has a soft level (--warn: finish current work and tell the user) and a hard
+level (--stop: write a handoff and stop). A number sets the level and turns it on;
+off/on switch it without losing the number.
 """
 import argparse
 import json
@@ -52,13 +56,13 @@ def show_usage(args):
 
 # --- config ----------------------------------------------------------------
 
-def percent(value):
-    if value.lower() in ("off", "none", "-"):
-        return None
+def level_value(value):
+    if value.lower() in ("on", "off"):
+        return value.lower()
     try:
         pct = int(value.rstrip("%"))
     except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a percentage or 'off', got {value!r}")
+        raise argparse.ArgumentTypeError(f"expected a percentage, 'on' or 'off', got {value!r}")
     if not 1 <= pct <= 100:
         raise argparse.ArgumentTypeError("percentage must be between 1 and 100")
     return pct
@@ -71,14 +75,14 @@ def positive(value):
     return n
 
 
-def fmt_pct(value):
-    return "-" if value is None else f"{value}%"
+def fmt_level(settings, level):
+    return f"{settings[level]}% {'on' if settings[f'{level}_on'] else 'off'}"
 
 
 def show_config(config):
     limits, _ = core.load_limits()
     names = list(limits) + [n for n in config["limits"] if n not in limits]
-    print(f"{'limit':14} {'now':>5} {'warn':>6} {'stop':>6}   statusline")
+    print(f"{'limit':14} {'now':>5}   {'soft (warn)':12} {'hard (stop)':12} statusline")
     for name in names:
         s = core.limit_settings(config, name)
         now = f"{limits[name]['percent']}%" if name in limits else "?"
@@ -88,9 +92,11 @@ def show_config(config):
         if name in limits and core.model_of(limits[name]):
             notes.append(f"hook only while running {core.model_of(limits[name])}")
         note = f"   ({', '.join(notes)})" if notes else ""
-        print(f"{name:14} {now:>5} {fmt_pct(s['warn']):>6} {fmt_pct(s['stop']):>6}   "
+        print(f"{name:14} {now:>5}   {fmt_level(s, 'warn'):12} {fmt_level(s, 'stop'):12} "
               f"{'shown' if s['show'] else 'hidden'}{note}")
-    print(f"\ncontext bar: {'on' if config['context_bar'] else 'off'}")
+    st = config["statusline"]
+    style = f"bar, width {st['bar_width']}" if st["style"] == "bar" else "percent"
+    print(f"\nstatusline: {style}; context {'on' if st['context'] else 'off'}")
     hook = config["hook"]
     print(f"hook: {'on' if hook['enabled'] else 'off'} - repeat warning every "
           f"{hook['repeat_warn']} tool calls, stop every {hook['repeat_stop']}")
@@ -105,15 +111,22 @@ def config_limit(config, args):
         config["limits"].pop(name, None)
     else:
         entry = config["limits"].setdefault(name, {})
-        if args.warn is not False:
-            entry["warn"] = args.warn
-        if args.stop is not False:
-            entry["stop"] = args.stop
+        for level in core.LEVELS:
+            value = getattr(args, level)
+            if value is None:
+                continue
+            if value != "off":
+                entry[f"{level}_on"] = True
+                if value != "on":
+                    entry[level] = value
+            else:
+                entry[f"{level}_on"] = False
         if args.show is not None:
             entry["show"] = args.show
         s = core.limit_settings(config, name)
-        if s["warn"] is not None and s["stop"] is not None and s["warn"] >= s["stop"]:
-            sys.exit("cc-usage: warn must be lower than stop")
+        warn, stop = core.threshold(s, "warn"), core.threshold(s, "stop")
+        if warn is not None and stop is not None and warn >= stop:
+            sys.exit("cc-usage: the soft level (warn) must be lower than the hard level (stop)")
     limits, _ = core.load_limits()
     if name not in limits:
         print(f"note: no '{name}' limit in the current usage data; known: {', '.join(limits) or '-'}")
@@ -128,8 +141,14 @@ def config_hook(config, args):
         config["hook"]["repeat_stop"] = args.repeat_stop
 
 
+def config_style(config, args):
+    config["statusline"]["style"] = args.style
+    if args.width:
+        config["statusline"]["bar_width"] = args.width
+
+
 def config_context(config, args):
-    config["context_bar"] = args.state == "on"
+    config["statusline"]["context"] = args.state == "on"
 
 
 def config_message(config, args):
@@ -159,8 +178,10 @@ def build_parser():
 
     limit = cfg_sub.add_parser("limit", help="thresholds and statusline visibility of one limit")
     limit.add_argument("name", help="session, weekly, or a model name such as fable")
-    limit.add_argument("--warn", type=percent, default=False, metavar="N|off")
-    limit.add_argument("--stop", type=percent, default=False, metavar="N|off")
+    limit.add_argument("--warn", type=level_value, metavar="N|on|off",
+                       help="soft level: finish current work and tell the user")
+    limit.add_argument("--stop", type=level_value, metavar="N|on|off",
+                       help="hard level: write a handoff and stop")
     vis = limit.add_mutually_exclusive_group()
     vis.add_argument("--show", dest="show", action="store_true", default=None)
     vis.add_argument("--hide", dest="show", action="store_false")
@@ -173,7 +194,12 @@ def build_parser():
     hook.add_argument("--repeat-stop", type=positive, metavar="N")
     hook.set_defaults(func=config_hook)
 
-    ctx = cfg_sub.add_parser("context", help="context window bar in the statusline")
+    style = cfg_sub.add_parser("style", help="statusline look: plain percentages or progress bars")
+    style.add_argument("style", choices=["percent", "bar"])
+    style.add_argument("--width", type=positive, metavar="N", help="bar width in characters")
+    style.set_defaults(func=config_style)
+
+    ctx = cfg_sub.add_parser("context", help="context window fill in the statusline")
     ctx.add_argument("state", choices=["on", "off"])
     ctx.set_defaults(func=config_context)
 

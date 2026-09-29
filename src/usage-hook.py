@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """PostToolUse / UserPromptSubmit hook: warns the agent about subscription limits.
 
-Per-limit thresholds come from config.json (edit with `cc-usage config`); the most
-severe level across limits wins. Defaults:
-  session (5-hour): warn at 80% (finish, don't start new work), stop at 90% (handoff + stop)
-  weekly:           stop at 95% only - a weekly warning would stall work for days
-  model-scoped (e.g. fable): stop at 95%, and only while the session runs on that model
+Per-limit soft (warn) and hard (stop) levels come from config.json (edit with
+`cc-usage config`); the most severe level across limits wins. Out of the box only the
+5-hour limit is on: warn at 85% (finish, don't start new work), stop at 95% (handoff +
+stop). Weekly and model-scoped limits (e.g. fable) are off by default; a model-scoped
+limit, when on, only counts while the session runs on that model.
 
 On PostToolUse a level is announced when first reached, then repeated every
 repeat_warn / repeat_stop tool calls. On UserPromptSubmit it is announced on every
@@ -47,9 +47,10 @@ def current_model(transcript_path):
 
 
 def level_of(pct, settings):
-    if settings["stop"] is not None and pct >= settings["stop"]:
+    warn, stop = core.threshold(settings, "warn"), core.threshold(settings, "stop")
+    if stop is not None and pct >= stop:
         return 2
-    return 1 if settings["warn"] is not None and pct >= settings["warn"] else 0
+    return 1 if warn is not None and pct >= warn else 0
 
 
 def worst_limit(limits, config, model):
@@ -92,7 +93,7 @@ def message(name, lim, level, config):
     if level == 2:
         return f"{head} {hook['stop_message'] or STOP_MESSAGE}"
     text = f"{head} {hook['warn_message'] or WARN_MESSAGE}"
-    stop = core.limit_settings(config, name)["stop"]
+    stop = core.threshold(core.limit_settings(config, name), "stop")
     if stop is not None and not hook["warn_message"]:
         text += f" At {stop}% you will have to write a handoff and stop."
     return text

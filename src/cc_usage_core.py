@@ -22,17 +22,24 @@ KEYCHAIN_SERVICE = os.environ.get("CC_USAGE_KEYCHAIN_SERVICE", "Claude Code-cred
 MAX_AGE = 120      # seconds before the cache is considered stale
 RETRY_EVERY = 60   # min seconds between background refresh attempts (also covers failures)
 
+LEVELS = ("warn", "stop")  # soft level: finish and warn the user; hard level: handoff and stop
+
 # Limit names: "session" (5-hour), "weekly" (all models), and the lowercased model
-# name for model-scoped weekly limits (e.g. "fable").
+# name for model-scoped weekly limits (e.g. "fable"). Each level has a percentage and
+# an on/off switch, so turning a level off keeps its percentage for later.
 DEFAULT_CONFIG = {
+    # out of the box only the 5-hour limit drives the hook
     "limits": {
-        "session": {"warn": 80, "stop": 90, "show": True},
-        "weekly": {"warn": None, "stop": 95, "show": True},
+        "session": {"warn": 85, "warn_on": True, "stop": 95, "stop_on": True, "show": True},
+        "weekly": {"warn": 85, "warn_on": False, "stop": 95, "stop_on": False, "show": True},
     },
     # applies to model-scoped limits (and any future limit) without their own entry
-    "default_limit": {"warn": None, "stop": 95, "show": True},
-    # context window fill bar in the statusline segment (turn off if your statusline has one)
-    "context_bar": True,
+    "default_limit": {"warn": 85, "warn_on": False, "stop": 95, "stop_on": False, "show": True},
+    "statusline": {
+        "style": "percent",  # "percent" (5h 18%) or "bar" (5h ██░░░░░░░░ 18%)
+        "bar_width": 10,
+        "context": True,     # context window fill (turn off if your statusline shows it)
+    },
     "hook": {
         "enabled": True,
         "repeat_warn": 25,     # tool calls between repeated warning reminders
@@ -65,19 +72,51 @@ def load_config():
             stored = json.load(f)
     except (OSError, ValueError):
         return config
-    # config format of the first release: {"thresholds": {"session": [w, s], "weekly_all": [w, s]}}
+    return _merge(config, _migrate(stored))
+
+
+def _migrate(stored):
+    """Upgrade configs written by earlier releases."""
+    # first release: {"thresholds": {"session": [warn, stop], "weekly_all": [warn, stop]}}
     for kind, (warn, stop) in (stored.pop("thresholds", None) or {}).items():
         name = "weekly" if kind == "weekly_all" else kind
         stored.setdefault("limits", {}).setdefault(name, {"warn": warn, "stop": stop})
-    return _merge(config, stored)
+    # levels without an on/off switch: a number meant on, null meant off
+    for entry in list((stored.get("limits") or {}).values()) + [stored.get("default_limit") or {}]:
+        for level in LEVELS:
+            if level in entry and f"{level}_on" not in entry:
+                entry[f"{level}_on"] = entry[level] is not None
+            if level in entry and entry[level] is None:
+                del entry[level]
+    if "context_bar" in stored:
+        stored.setdefault("statusline", {})["context"] = stored.pop("context_bar")
+    return stored
+
+
+def _diff(config, defaults):
+    out = {}
+    for key, value in config.items():
+        if isinstance(value, dict) and isinstance(defaults.get(key), dict):
+            sub = _diff(value, defaults[key])
+            if sub:
+                out[key] = sub
+        elif key not in defaults or defaults[key] != value:
+            out[key] = value
+    return out
 
 
 def save_config(config):
-    _write_json(CONFIG, config)
+    """Store only what differs from the defaults, so new defaults reach existing installs."""
+    _write_json(CONFIG, _diff(config, DEFAULT_CONFIG))
 
 
 def limit_settings(config, name):
     return {**config["default_limit"], **config["limits"].get(name, {})}
+
+
+def threshold(settings, level):
+    """The active percentage for a level, or None when the level is switched off."""
+    return settings[level] if settings[f"{level}_on"] else None
 
 
 def _write_json(path, obj):

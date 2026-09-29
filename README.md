@@ -3,17 +3,24 @@
 Claude Code subscription usage — in your terminal, in the statusline, and in front of the agent itself.
 
 - **`cc-usage`** prints the same numbers as `/usage`: 5-hour session, weekly limits, extra-usage spend.
-- **Statusline segment** appends `ctx ██░░░░░░░░ 15% 5h 18% 7d 20% Fable 0%` to your existing statusline
-  (or shows a minimal one).
+- **Statusline segment** appends usage to your existing statusline (or shows a minimal one), as plain
+  percentages or progress bars:
+
+  ```
+  ctx 15% 5h 18% 7d 20% Fable 0%
+  ctx ██░░░░░░░░ 15% 5h ██░░░░░░░░ 18% 7d ██░░░░░░░░ 20% Fable ░░░░░░░░░░ 0%
+  ```
 - **Limit hook** tells the agent when you are close to a limit, so a long autonomous run wraps up and
-  leaves a handoff instead of dying mid-task:
+  leaves a handoff instead of dying mid-task. Every limit has a soft level (finish current work, tell you)
+  and a hard level (write `HANDOFF.md`, stop), each with its own percentage and on/off switch:
 
-  | Limit                          | Warning (finish current work, tell you) | Critical (write `HANDOFF.md`, stop) |
-  |--------------------------------|------------------------------------------|-------------------------------------|
-  | 5-hour session                 | 80%                                      | 90%                                 |
-  | Weekly                         | —                                        | 95%                                 |
-  | Weekly per model (e.g. Fable)  | —                                        | 95%, only while running that model  |
+  | Limit                         | Soft (warn)   | Hard (stop)   |
+  |-------------------------------|---------------|---------------|
+  | 5-hour session                | 85%, on       | 95%, on       |
+  | Weekly                        | 85%, off      | 95%, off      |
+  | Weekly per model (e.g. Fable) | 85%, off      | 95%, off      |
 
+  Per-model limits only count while the session runs on that model.
 - **`cc-usage config`** changes all of that from the command line — or just ask the agent to.
 
 ```
@@ -63,26 +70,31 @@ Restores your original statusline, removes the hooks and the CLAUDE.md block, an
 
 ```
 $ cc-usage config
-limit            now   warn   stop   statusline
-session          18%    80%    90%   shown
-weekly           20%      -    95%   shown
-fable             0%      -    95%   shown   (default, hook only while running Fable)
+limit            now   soft (warn)  hard (stop)  statusline
+session          18%   85% on       95% on       shown
+weekly           20%   85% off      95% off      shown
+fable             0%   85% off      95% off      shown   (default, hook only while running Fable)
 
-context bar: on
+statusline: percent; context on
 hook: on - repeat warning every 25 tool calls, stop every 5
 warn message: built-in
 stop message: built-in
 ```
 
 Limit names are `session`, `weekly`, and the lowercased model name for per-model weekly limits.
-Percentages accept `off` to disable a level. Changes apply immediately.
+A number sets a level and turns it on; `on` / `off` switch it without losing the number.
+Changes apply immediately.
 
 ```sh
-cc-usage config limit session --warn 70 --stop 85   # thresholds
-cc-usage config limit fable --warn 80                # per-model limits work the same way
+cc-usage config limit session --warn 70 --stop 90    # set both levels of the 5-hour limit
+cc-usage config limit weekly --stop on               # turn on the weekly hard level (95%)
+cc-usage config limit fable --warn 80 --stop on      # per-model limits work the same way
+cc-usage config limit session --warn off             # hard level only
 cc-usage config limit weekly --hide                  # remove from the statusline (--show to bring back)
 cc-usage config limit session --reset                # back to the default
-cc-usage config context off                          # hide the context bar (e.g. if your statusline has one)
+cc-usage config style bar                            # progress bars (percent for plain numbers)
+cc-usage config style bar --width 5                  # shorter bars
+cc-usage config context off                          # hide context fill (e.g. if your statusline has it)
 cc-usage config hook off                             # disable the hook (on to enable)
 cc-usage config hook --repeat-warn 10 --repeat-stop 3
 cc-usage config message stop "Run /gsd-pause-work, then stop."   # custom instruction for a level
@@ -90,8 +102,9 @@ cc-usage config message stop --reset
 cc-usage config reset                                # all defaults
 ```
 
-Settings live in `~/.claude/cc-usage/config.json` and survive re-installs. The agent knows about
-`cc-usage config`, so "raise the 5h stop to 95%" in a Claude Code session works too.
+Settings live in `~/.claude/cc-usage/config.json`, which stores only what you changed, so new defaults
+from updates still reach you. The agent knows about `cc-usage config`, so "turn on the weekly stop at 90%"
+in a Claude Code session works too.
 
 ## How it works
 
